@@ -8,62 +8,50 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # --- CONFIG ---
 MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-CHECKPOINT_PATH = "./results/octo_lora/checkpoint-702"
+CHECKPOINT_PATH = "./results/octo_lora_plus/checkpoint-702"
 MAX_LEN = 512
 RANK = 16
 ALPHA = 32
 
 
 # ─────────────────────────────────────────────────────────────
-# CUSTOM LAYER SCHEMATICS (Identical structure to training)
+# CUSTOM LAYER SCHEMATICS
+# Must stay byte-for-byte identical to train.py's OctoLoRALayer. This used
+# to define a different gating mechanism (a "linearity score" heuristic)
+# than the one actually used during training (gradient-norm EMA routing),
+# so a trained checkpoint's A/B weights were being evaluated through a
+# routing function they were never optimized under.
 # ─────────────────────────────────────────────────────────────
 
 class OctoLoRALayer(nn.Module):
     def __init__(self, base_layer: nn.Linear, rank: int = 16, alpha: float = 32):
         super().__init__()
-        in_dim  = base_layer.in_features
+        in_dim = base_layer.in_features
         out_dim = base_layer.out_features
 
-        self.base   = base_layer
+        self.base = base_layer
         self.base.requires_grad_(False)
 
-        self.A      = nn.Linear(in_dim, rank, bias=False)
-        self.B      = nn.Linear(rank, out_dim, bias=False)
-        self.scale  = alpha / rank
+        self.A = nn.Linear(in_dim, rank, bias=False)
+        self.B = nn.Linear(rank, out_dim, bias=False)
+        self.scale = alpha / rank
+
+        self.register_buffer("grad_norm_A", torch.tensor(1.0))
+        self.register_buffer("grad_norm_B", torch.tensor(1.0))
+        self.ema = 0.9
 
         self.A.weight.requires_grad = True
         self.B.weight.requires_grad = True
 
-        self.register_buffer("lin_A", torch.tensor(1.0))
-        self.register_buffer("lin_B", torch.tensor(1.0))
-        self.ema    = 0.95
-
-    def _linearity_score(self, layer, x: torch.Tensor) -> float:
-        with torch.no_grad():
-            sample = x[:2].detach().clone()
-            fx     = layer(sample)
-            f2x    = layer(2 * sample)
-            ratio  = (f2x / (2 * fx.abs().clamp(min=1e-6))).abs()
-            return ratio.clamp(0, 2).mean().item()
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
+        mid = self.A(x)
 
-        if self.training:
-            score_A = self._linearity_score(self.A, x)
-            with torch.no_grad():
-                mid_detached = self.A(x[:2].detach().clone())
-                score_B = self._linearity_score(self.B, mid_detached)
+        total = self.grad_norm_A + self.grad_norm_B + 1e-8
+        a_weight = (self.grad_norm_B / total).clamp(0.1, 1.0)
 
-            self.lin_A = self.ema * self.lin_A + (1 - self.ema) * score_A
-            self.lin_B = self.ema * self.lin_B + (1 - self.ema) * score_B
-
-        if self.lin_A >= self.lin_B:
-            adapter = self.B(self.A(x)) * self.scale
-        else:
-            with torch.no_grad():
-                mid = self.A(x)
-            adapter = self.B(mid) * self.scale
+        mid_scaled = mid * a_weight + mid.detach() * (1 - a_weight)
+        adapter = self.B(mid_scaled) * self.scale
 
         return base_out + adapter
 
@@ -108,7 +96,7 @@ def extract_answer(text: str) -> str | None:
     return numbers[-1].replace(",", "") if numbers else None
 
 
-def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda", data_path="./"):
+def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda", data_path="data"):
     print("Loading local evaluation dataset...", flush=True)
     with open(os.path.join(data_path, "gsm8k_test_alpaca.json")) as f:
         dataset = json.load(f)
@@ -118,10 +106,13 @@ def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda", data_path=".
     model.eval()
     correct = 0
     for i, example in enumerate(dataset):
+        # This test file's real question lives in "instruction"; "input" is
+        # always empty here (unlike the alpaca-style train file, where the
+        # roles of those two fields are reversed - see train.py).
         prompt = (
             "<|begin_of_text|>"
             "<|start_header_id|>user<|end_header_id|>\n\n"
-            f"Solve this step by step:\n{example['input']}"
+            f"Solve this step by step:\n{example['instruction']}"
             "<|eot_id|>"
             "<|start_header_id|>assistant<|end_header_id|>\n\n"
         )

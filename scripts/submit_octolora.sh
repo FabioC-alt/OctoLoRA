@@ -55,13 +55,14 @@ export DS_SKIP_CUDA_COMPILATION=1
 cd /scratch.hpc/fabio.ciraci2/OctoLoRA
 source .venv/bin/activate
 
-python3 OctoLoRA.py
+python3 src/train.py
 
-
-TOKEN="8969231949:AAFv9wU0l4OLUZfJgM5m2KcR9WQvhrElOi4"
-CHAT_ID="549421087"
-MESSAGE="Execution Completed for OctoLoRA!"
-
-curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
-     -d "chat_id=$CHAT_ID" \
-     -d "text=$MESSAGE"
+# Notify on completion via Telegram. Set these in your shell profile or a
+# local, untracked .env - do not hardcode secrets here.
+if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+    curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+         -d "chat_id=$TELEGRAM_CHAT_ID" \
+         -d "text=Execution Completed for OctoLoRA!"
+else
+    echo "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set, skipping notification."
+fi

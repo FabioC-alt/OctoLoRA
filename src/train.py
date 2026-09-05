@@ -211,17 +211,21 @@ def load_gsm8k(tokenizer, data_files, split="train", max_len=MAX_LEN):
     dataset = load_dataset("json", data_files=data_files, split=split)
 
     def format_example(example):
-        # Safety gate: check for missing or empty keys in this specific row
-        instruction = example.get("instruction")
+        # In this dataset's alpaca schema, "input" holds the actual math
+        # question and "instruction" is a fixed boilerplate string
+        # ("Solve the following math problem step-by-step.") repeated on
+        # every row. Reading "instruction" here would train the model on a
+        # constant, uninformative prompt instead of the real question.
+        question = example.get("input") or example.get("instruction")
         output = example.get("output")
-        
-        if not instruction or not output:
+
+        if not question or not output:
             # Fallback to avoid crashing the data collator down the line
-            instruction = "Empty question fallback"
+            question = "Empty question fallback"
             output = "Empty answer fallback"
 
         messages = [
-            {"role": "user", "content": f"Solve this step by step:\n{instruction}"},
+            {"role": "user", "content": f"Solve this step by step:\n{question}"},
             {"role": "assistant", "content": output}
         ]
         full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
@@ -301,7 +305,7 @@ def make_forward_safe(model):
     return model
 
 def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda"):
-    dataset = load_dataset("json", data_files = "gsm8k_test_alpaca.json", split="test")
+    dataset = load_dataset("json", data_files="data/gsm8k_test_alpaca.json", split="test")
     
     dataset = dataset.select(range(min(n_examples, len(dataset))))
 
@@ -335,7 +339,7 @@ def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda"):
         )
 
         pred   = extract_answer(generated)
-        target = extract_answer(example["answer"])
+        target = extract_answer(example["output"])
 
         if pred and target and pred == target:
             correct += 1
@@ -358,7 +362,7 @@ if __name__ == "__main__":
     tokenizer.padding_side = "right"
 
     logger.info("Loading GSM8K datasets...")
-    train_files = "gsm8k_train_alpaca.json"
+    train_files = "data/gsm8k_train_alpaca.json"
     train_data = load_gsm8k(tokenizer, train_files)
     logger.info("Found %d training samples", len(train_data))
 
