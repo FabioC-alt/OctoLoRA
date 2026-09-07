@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=OctoLoRAEval
-#SBATCH --output=OctoLoRAEval.out
-#SBATCH --error=OctoLoRAEval.err
+#SBATCH --output=OctoLoRAEval-%j.out
+#SBATCH --error=OctoLoRAEval-%j.err
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -46,10 +46,14 @@ echo "Starting evaluation..."
 cd /scratch.hpc/fabio.ciraci2/OctoLoRA
 source .venv/bin/activate
 
-# Optional: sbatch scripts/submit_evaluate.sh <n_examples> to evaluate a
-# subset instead of the full test file.
+# Optional args: sbatch scripts/submit_evaluate.sh [checkpoint_dir] [n_examples]
+# e.g. sbatch scripts/submit_evaluate.sh results/vanilla_lora/checkpoint-702 200
+CHECKPOINT_ARG=()
 if [[ -n "$1" ]]; then
-    python3 src/evaluate.py --n-examples "$1"
-else
-    python3 src/evaluate.py
+    CHECKPOINT_ARG=(--checkpoint "$1")
 fi
+N_EXAMPLES_ARG=()
+if [[ -n "$2" ]]; then
+    N_EXAMPLES_ARG=(--n-examples "$2")
+fi
+python3 src/evaluate.py "${CHECKPOINT_ARG[@]}" "${N_EXAMPLES_ARG[@]}"

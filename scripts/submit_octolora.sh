@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=OctoLoRAX
-#SBATCH --output=OctoLoRAX.out
-#SBATCH --error=OctoLoRAX.err
+#SBATCH --output=OctoLoRAX-%j.out
+#SBATCH --error=OctoLoRAX-%j.err
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -67,7 +67,9 @@ export DS_SKIP_CUDA_COMPILATION=1
 cd /scratch.hpc/fabio.ciraci2/OctoLoRA
 source .venv/bin/activate
 
-python3 src/train.py
+# Forward any extra sbatch arguments to train.py, e.g. to run an ablation
+# variant: sbatch scripts/submit_octolora.sh --gate false --lora-plus false
+python3 src/train.py "$@"
 
 # Notify on completion via Telegram. Set these in your shell profile or a
 # local, untracked .env - do not hardcode secrets here.

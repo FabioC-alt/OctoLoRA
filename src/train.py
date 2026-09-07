@@ -1,12 +1,20 @@
 """
 OctoLoRA Training Pipeline with LoRA+ Optimizer on GSM8K
 --------------------------------------------------------
-Implements gradient-norm-driven adaptive routing (OctoLoRA) 
+Implements gradient-norm-driven adaptive routing (OctoLoRA)
 combined with separate parameter group learning rates (LoRA+).
+
+Supports ablating the two ideas independently via --gate/--lora-plus,
+so the same script can produce the vanilla-LoRA, LoRA+-only,
+gate-only, and full-OctoLoRA runs needed to isolate what each part
+contributes.
 """
 
+import argparse
 import functools
+import json
 import logging
+import os
 import re
 import torch
 import torch.nn as nn
@@ -49,10 +57,18 @@ logger = logging.getLogger(__name__)
 # 2. OPTION 1: LoRA+ OPTIMIZER BUILDER
 # ─────────────────────────────────────────────────────────────
 
-def build_lora_plus_optimizer(model, lr=2e-4, b_lr_ratio=16.0, weight_decay=0.0):
+def build_optimizer(model, lr=2e-4, use_lora_plus=True, b_lr_ratio=16.0, weight_decay=0.0):
     """
-    Splits trainable weights into distinct low-rank matrix parameter groups.
+    If use_lora_plus, splits trainable weights into A/B parameter groups
+    with different learning rates (LoRA+). Otherwise builds a single-group
+    AdamW at a flat lr, i.e. plain LoRA optimization - the ablation
+    baseline for isolating what LoRA+ contributes on its own.
     """
+    if not use_lora_plus:
+        params = [p for p in model.parameters() if p.requires_grad]
+        logger.info("Plain optimizer built: single LR = %e for all trainable params", lr)
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
     a_params, b_params = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -66,9 +82,9 @@ def build_lora_plus_optimizer(model, lr=2e-4, b_lr_ratio=16.0, weight_decay=0.0)
         {"params": a_params, "lr": lr},
         {"params": b_params, "lr": lr * b_lr_ratio},
     ]
-    
+
     logger.info(
-        "LoRA+ Optimizer built: Matrix A LR = %e, Matrix B LR = %e", 
+        "LoRA+ Optimizer built: Matrix A LR = %e, Matrix B LR = %e",
         lr, lr * b_lr_ratio
     )
     return torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=weight_decay)
@@ -79,7 +95,7 @@ def build_lora_plus_optimizer(model, lr=2e-4, b_lr_ratio=16.0, weight_decay=0.0)
 # ─────────────────────────────────────────────────────────────
 
 class OctoLoRALayer(nn.Module):
-    def __init__(self, base_layer: nn.Linear, rank: int = 16, alpha: float = 32):
+    def __init__(self, base_layer: nn.Linear, rank: int = 16, alpha: float = 32, use_gate: bool = True):
         super().__init__()
         in_dim = base_layer.in_features
         out_dim = base_layer.out_features
@@ -90,17 +106,19 @@ class OctoLoRALayer(nn.Module):
         self.A = nn.Linear(in_dim, rank, bias=False)
         self.B = nn.Linear(rank, out_dim, bias=False)
         self.scale = alpha / rank
-
-        # Track historical backward scaling safely using persistent buffers
-        self.register_buffer("grad_norm_A", torch.tensor(1.0))
-        self.register_buffer("grad_norm_B", torch.tensor(1.0))
-        self.ema = 0.9
+        self.use_gate = use_gate
 
         nn.init.kaiming_uniform_(self.A.weight, a=5**0.5)
         nn.init.zeros_(self.B.weight)
 
-        self.A.weight.register_hook(self._make_grad_hook("A"))
-        self.B.weight.register_hook(self._make_grad_hook("B"))
+        if self.use_gate:
+            # Track historical backward scaling safely using persistent buffers
+            self.register_buffer("grad_norm_A", torch.tensor(1.0))
+            self.register_buffer("grad_norm_B", torch.tensor(1.0))
+            self.ema = 0.9
+
+            self.A.weight.register_hook(self._make_grad_hook("A"))
+            self.B.weight.register_hook(self._make_grad_hook("B"))
 
     def _make_grad_hook(self, which):
         def hook(grad):
@@ -114,17 +132,17 @@ class OctoLoRALayer(nn.Module):
         base_out = self.base(x)
         mid = self.A(x)
 
-        # Continuous adaptive routing calculation based on gradient histories
-        total = self.grad_norm_A + self.grad_norm_B + 1e-8
-        a_weight = (self.grad_norm_B / total).clamp(0.1, 1.0)
+        if self.use_gate:
+            # Continuous adaptive routing calculation based on gradient histories
+            total = self.grad_norm_A + self.grad_norm_B + 1e-8
+            a_weight = (self.grad_norm_B / total).clamp(0.1, 1.0)
+            # Scaled gradient gate flow management
+            mid = mid * a_weight + mid.detach() * (1 - a_weight)
 
-        # Scaled gradient gate flow management
-        mid_scaled = mid * a_weight + mid.detach() * (1 - a_weight)
-        adapter = self.B(mid_scaled) * self.scale
-
+        adapter = self.B(mid) * self.scale
         return base_out + adapter
 
-def inject_octo_lora(model, rank=16, alpha=32, target_modules=None):
+def inject_octo_lora(model, rank=16, alpha=32, target_modules=None, use_gate=True):
     if target_modules is None:
         target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
 
@@ -145,14 +163,14 @@ def inject_octo_lora(model, rank=16, alpha=32, target_modules=None):
         attr = parts[-1]
 
         device, dtype = module.weight.device, module.weight.dtype
-        octo = OctoLoRALayer(module, rank=rank, alpha=alpha).to(device=device, dtype=dtype)
+        octo = OctoLoRALayer(module, rank=rank, alpha=alpha, use_gate=use_gate).to(device=device, dtype=dtype)
         octo.A.weight.requires_grad_(True)
         octo.B.weight.requires_grad_(True)
 
         setattr(parent, attr, octo)
         replaced += 1
 
-    logger.info("[OctoLoRA] Replaced %d layers with OctoLoRALayer", replaced)
+    logger.info("[OctoLoRA] Replaced %d layers with OctoLoRALayer (gate=%s)", replaced, use_gate)
     return model
 
 
@@ -163,11 +181,16 @@ def inject_octo_lora(model, rank=16, alpha=32, target_modules=None):
 class OctoLoraPlusTrainer(Trainer):
     """Custom Trainer subclass overriding optimizer creation and forcing strict tensor safety."""
 
+    def __init__(self, *args, use_lora_plus=True, **kwargs):
+        self.use_lora_plus = use_lora_plus
+        super().__init__(*args, **kwargs)
+
     def create_optimizer(self):
         if self.optimizer is None:
-            self.optimizer = build_lora_plus_optimizer(
+            self.optimizer = build_optimizer(
                 self.model,
                 lr=self.args.learning_rate,
+                use_lora_plus=self.use_lora_plus,
                 b_lr_ratio=B_LR_RATIO,
                 weight_decay=self.args.weight_decay
             )
@@ -358,8 +381,48 @@ def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda"):
 # 6. MAIN EXECUTION
 # ─────────────────────────────────────────────────────────────
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train an OctoLoRA / ablation variant on GSM8K")
+    parser.add_argument(
+        "--gate", type=lambda s: s.lower() not in ("false", "0", "no"), default=True,
+        help="Enable gradient-adaptive gating between A and B (default: true). "
+             "--gate false trains plain LoRA up/down projections.",
+    )
+    parser.add_argument(
+        "--lora-plus", type=lambda s: s.lower() not in ("false", "0", "no"), default=True,
+        help="Enable LoRA+ split A/B learning rates (default: true). "
+             "--lora-plus false uses a single flat learning rate for all trainable params.",
+    )
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Override the checkpoint output directory (default: derived from --gate/--lora-plus).",
+    )
+    return parser.parse_args()
+
+
+def variant_name(use_gate, use_lora_plus):
+    if use_gate and use_lora_plus:
+        return "octo_lora_plus"
+    if use_lora_plus:
+        return "lora_plus_only"
+    if use_gate:
+        return "gate_only"
+    return "vanilla_lora"
+
+
 if __name__ == "__main__":
+    args = parse_args()
     torch.manual_seed(SEED)
+
+    output_dir = args.output_dir or f"./results/{variant_name(args.gate, args.lora_plus)}"
+    logger.info("Run variant: gate=%s lora_plus=%s -> output_dir=%s", args.gate, args.lora_plus, output_dir)
+
+    # Persist the run config alongside the checkpoints so evaluate.py can
+    # reconstruct the exact same architecture later without guessing.
+    os.makedirs(output_dir, exist_ok=True)
+    run_config = {"use_gate": args.gate, "use_lora_plus": args.lora_plus, "rank": RANK, "alpha": ALPHA}
+    with open(os.path.join(output_dir, "octolora_run_config.json"), "w") as f:
+        json.dump(run_config, f, indent=2)
 
     logger.info("Loading tokenizers...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -375,11 +438,10 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto"
     )
-   
+
     model = make_forward_safe(model)
 
-    # Apply Option 2: Active Dynamic Gradient Gated Routing
-    model = inject_octo_lora(model, rank=RANK, alpha=ALPHA)
+    model = inject_octo_lora(model, rank=RANK, alpha=ALPHA, use_gate=args.gate)
 
     # Track structural params
     total   = sum(p.numel() for p in model.parameters())
@@ -387,7 +449,7 @@ if __name__ == "__main__":
     logger.info("Trainable Density: %s / %s (%.4f%%)", f"{trained:,}", f"{total:,}", 100 * trained / total)
 
     training_args = TrainingArguments(
-        output_dir="./results/octo_lora_plus",
+        output_dir=output_dir,
         num_train_epochs=EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
@@ -409,6 +471,7 @@ if __name__ == "__main__":
         args=training_args,
         train_dataset=train_data,
         data_collator=DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, label_pad_token_id=-100),
+        use_lora_plus=args.lora_plus,
     )
     
     logger.info("Beginning fine-tuning engine pass...")

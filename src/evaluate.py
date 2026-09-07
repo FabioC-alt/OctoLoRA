@@ -24,7 +24,7 @@ ALPHA = 32
 # ─────────────────────────────────────────────────────────────
 
 class OctoLoRALayer(nn.Module):
-    def __init__(self, base_layer: nn.Linear, rank: int = 16, alpha: float = 32):
+    def __init__(self, base_layer: nn.Linear, rank: int = 16, alpha: float = 32, use_gate: bool = True):
         super().__init__()
         in_dim = base_layer.in_features
         out_dim = base_layer.out_features
@@ -35,10 +35,12 @@ class OctoLoRALayer(nn.Module):
         self.A = nn.Linear(in_dim, rank, bias=False)
         self.B = nn.Linear(rank, out_dim, bias=False)
         self.scale = alpha / rank
+        self.use_gate = use_gate
 
-        self.register_buffer("grad_norm_A", torch.tensor(1.0))
-        self.register_buffer("grad_norm_B", torch.tensor(1.0))
-        self.ema = 0.9
+        if self.use_gate:
+            self.register_buffer("grad_norm_A", torch.tensor(1.0))
+            self.register_buffer("grad_norm_B", torch.tensor(1.0))
+            self.ema = 0.9
 
         self.A.weight.requires_grad = True
         self.B.weight.requires_grad = True
@@ -47,16 +49,16 @@ class OctoLoRALayer(nn.Module):
         base_out = self.base(x)
         mid = self.A(x)
 
-        total = self.grad_norm_A + self.grad_norm_B + 1e-8
-        a_weight = (self.grad_norm_B / total).clamp(0.1, 1.0)
+        if self.use_gate:
+            total = self.grad_norm_A + self.grad_norm_B + 1e-8
+            a_weight = (self.grad_norm_B / total).clamp(0.1, 1.0)
+            mid = mid * a_weight + mid.detach() * (1 - a_weight)
 
-        mid_scaled = mid * a_weight + mid.detach() * (1 - a_weight)
-        adapter = self.B(mid_scaled) * self.scale
-
+        adapter = self.B(mid) * self.scale
         return base_out + adapter
 
 
-def inject_octo_lora(model, rank=16, alpha=32, target_modules=None):
+def inject_octo_lora(model, rank=16, alpha=32, target_modules=None, use_gate=True):
     if target_modules is None:
         target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
 
@@ -76,13 +78,13 @@ def inject_octo_lora(model, rank=16, alpha=32, target_modules=None):
         device = module.weight.device
         dtype = module.weight.dtype
 
-        octo = OctoLoRALayer(module, rank=rank, alpha=alpha)
+        octo = OctoLoRALayer(module, rank=rank, alpha=alpha, use_gate=use_gate)
         octo.to(device=device, dtype=dtype)
 
         setattr(parent, attr, octo)
         replaced += 1
 
-    print(f"[OctoLoRA] Injected {replaced} custom architecture boundaries.", flush=True)
+    print(f"[OctoLoRA] Injected {replaced} custom architecture boundaries (gate={use_gate}).", flush=True)
     model.config.use_cache = False
     return model
 
@@ -152,7 +154,29 @@ if __name__ == "__main__":
         default=None,
         help="Number of test examples to evaluate (default: all 1319)",
     )
+    parser.add_argument(
+        "--checkpoint",
+        default=CHECKPOINT_PATH,
+        help=f"Path to the checkpoint directory to evaluate (default: {CHECKPOINT_PATH})",
+    )
     args = parser.parse_args()
+    checkpoint_path = args.checkpoint
+
+    # Runs produced by the ablation-aware train.py write octolora_run_config.json
+    # alongside the checkpoint (in the run's output_dir, one level up from a
+    # specific checkpoint-N folder). Older checkpoints (e.g. checkpoint-702,
+    # trained before this existed) don't have it - fall back to the
+    # historical defaults (gate on, rank 16, alpha 32) in that case.
+    run_config = {"use_gate": True, "rank": RANK, "alpha": ALPHA}
+    for config_dir in (checkpoint_path, os.path.dirname(checkpoint_path.rstrip("/"))):
+        config_path = os.path.join(config_dir, "octolora_run_config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                run_config.update(json.load(f))
+            print(f"Loaded run config from {config_path}: {run_config}", flush=True)
+            break
+    else:
+        print(f"No octolora_run_config.json found near {checkpoint_path}; assuming gate=True, rank={RANK}, alpha={ALPHA}", flush=True)
 
     print("Initializing components...", flush=True)
     print("Loading tokenizer...", flush=True)
@@ -167,11 +191,13 @@ if __name__ == "__main__":
     )
 
     print("Reconstructing OctoLoRA routing framework...", flush=True)
-    model = inject_octo_lora(base_model, rank=RANK, alpha=ALPHA)
+    model = inject_octo_lora(
+        base_model, rank=run_config["rank"], alpha=run_config["alpha"], use_gate=run_config["use_gate"]
+    )
 
-    print(f"Loading custom weights from checkpoint: {CHECKPOINT_PATH}", flush=True)
-    safetensors_file = os.path.join(CHECKPOINT_PATH, "model.safetensors")
-    pytorch_file = os.path.join(CHECKPOINT_PATH, "pytorch_model.bin")
+    print(f"Loading custom weights from checkpoint: {checkpoint_path}", flush=True)
+    safetensors_file = os.path.join(checkpoint_path, "model.safetensors")
+    pytorch_file = os.path.join(checkpoint_path, "pytorch_model.bin")
 
     if os.path.exists(safetensors_file):
         from safetensors.torch import load_file
@@ -181,7 +207,7 @@ if __name__ == "__main__":
         state_dict = torch.load(pytorch_file, map_location="cpu")
         model.load_state_dict(state_dict, strict=False)
     else:
-        raise FileNotFoundError(f"Could not locate training checkpoint files in {CHECKPOINT_PATH}")
+        raise FileNotFoundError(f"Could not locate training checkpoint files in {checkpoint_path}")
 
     print("Framework generation completed. Starting evaluation pipeline...", flush=True)
     evaluate_gsm8k(model, tokenizer, n_examples=args.n_examples)

@@ -13,19 +13,25 @@ own adapter layer, `OctoLoRALayer`, which replaces the attention projections
 
 - Each layer adds a low-rank `B(A(x))` update on top of the frozen base
   projection, as in standard LoRA.
-- Unlike standard LoRA, it tracks an EMA of the gradient norm flowing into
-  `A` and `B` separately, and uses the ratio between them to gate how much of
-  `A`'s output is allowed to flow into `B` on the forward pass (see
-  `_make_grad_hook` and the `a_weight` blend in `OctoLoRALayer.forward`).
-  The intent is to let the layer adapt which matrix dominates learning at
-  a given point in training, instead of a fixed rank/alpha split.
-- On top of this, `build_lora_plus_optimizer` puts `A.weight` and `B.weight`
-  parameters into separate optimizer groups so `B` trains at a higher
+- **The gate is not a Mixture-of-Experts / routing mechanism**, despite the
+  name — there's only ever one `A`/`B` pair per layer, and the gated and
+  ungated forward passes produce numerically identical output (`mid *
+  a_weight + mid.detach() * (1 - a_weight)` always equals `mid`, since
+  `.detach()` only affects the gradient, not the value). What it actually
+  does is control **how much gradient reaches `A` during backprop**, based
+  on an EMA of `A` vs `B`'s recent gradient norms (`_make_grad_hook` in
+  `OctoLoRALayer`). So the honest description is: a per-layer, per-step
+  *adaptive* version of LoRA+'s idea, not a routing/expert-selection method.
+- `build_optimizer` (LoRA+ mode) puts `A.weight` and `B.weight` parameters
+  into separate optimizer groups so `B` trains at a higher, but *fixed*,
   learning rate (`B_LR_RATIO`), following the
-  [LoRA+](https://arxiv.org/abs/2402.12354) paper.
+  [LoRA+](https://arxiv.org/abs/2402.12354) paper. OctoLoRA's gate is best
+  understood as trying to make that fixed ratio adaptive per layer instead.
 - `OctoLoraPlusTrainer` (a `transformers.Trainer` subclass) wires the custom
   optimizer in and clamps any out-of-range token ids in `input_ids`/`labels`
   before the forward pass, as a guard against embedding/index crashes.
+- The gate and the LoRA+ optimizer are independently toggleable via
+  `--gate`/`--lora-plus` for ablation (see "Ablations" below).
 
 ## Repository layout
 
@@ -68,9 +74,40 @@ sbatch scripts/submit_evaluate.sh    # evaluation, once a checkpoint exists
 ```
 
 Before running `submit_evaluate.sh`, check which checkpoint directory
-training actually produced (`ls results/octo_lora_plus/`) and update
-`CHECKPOINT_PATH` at the top of `src/evaluate.py` to match — the number in
-that path depends on your dataset size and batch config.
+training actually produced (`ls results/<variant>/`) and pass it as the
+first argument, and optionally a subset size as the second:
+
+```bash
+sbatch scripts/submit_evaluate.sh results/octo_lora_plus/checkpoint-702
+sbatch scripts/submit_evaluate.sh results/vanilla_lora/checkpoint-702 200
+```
+
+## Ablations
+
+`src/train.py` can isolate the two ideas in OctoLoRA independently via
+`--gate` and `--lora-plus` (both default to `true`, matching the original
+behavior):
+
+| variant | `--gate` | `--lora-plus` | what it tests |
+|---|---|---|---|
+| `vanilla_lora` | false | false | plain LoRA baseline |
+| `lora_plus_only` | false | true | LoRA+'s fixed A/B learning-rate split alone |
+| `gate_only` | true | false | the gradient-adaptive gate alone, flat learning rate |
+| `octo_lora_plus` | true | true | both combined (the default) |
+
+```bash
+sbatch scripts/submit_octolora.sh --gate false --lora-plus false   # vanilla LoRA
+sbatch scripts/submit_octolora.sh --gate false                     # LoRA+ only
+sbatch scripts/submit_octolora.sh --lora-plus false                # gate only
+sbatch scripts/submit_octolora.sh                                  # OctoLoRA (default)
+```
+
+Each run writes to its own `results/<variant>/` directory and drops an
+`octolora_run_config.json` there recording exactly which flags were used, so
+`src/evaluate.py --checkpoint results/<variant>/checkpoint-N` always
+reconstructs the matching architecture automatically. Run each variant with
+a few different seeds (`SEED` at the top of `train.py`) before comparing —
+GSM8K accuracy has real run-to-run noise on a dataset this size.
 
 Secrets are read from the environment, not hardcoded:
 
@@ -141,12 +178,12 @@ still worth checking/improving before trusting the results:
   response. Standard instruction-tuning practice masks the prompt with
   `-100` so gradient signal focuses on the answer. Worth trying, likely a
   moderate quality improvement.
-- **Get an ablation against plain LoRA.** Since there's no comparison point,
-  it's hard to know whether the gradient-adaptive gating or the LoRA+
-  optimizer actually help versus a vanilla LoRA (fixed r/alpha, one learning
-  rate) baseline. Training a plain-LoRA run (or using `peft`'s `LoraConfig`
-  directly) on the same fixed data would isolate whether OctoLoRA's routing
-  is pulling its weight.
+- **Run the ablation against plain LoRA and LoRA+ alone** (see "Ablations"
+  above — `--gate`/`--lora-plus` now make this a one-line `sbatch` call
+  instead of a manual comparison point). Until all four variants have been
+  run with a few seeds each, it isn't actually known whether the
+  gradient-adaptive gate is contributing anything beyond what LoRA+'s fixed
+  ratio already gets you.
 - **The token-id clamping in `compute_loss`/`make_forward_safe` is a
   band-aid, not a fix.** Silently zeroing out-of-range token ids can mask a
   real tokenizer/model vocab mismatch (this is exactly what
