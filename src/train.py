@@ -305,7 +305,12 @@ def make_forward_safe(model):
     return model
 
 def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda"):
-    dataset = load_dataset("json", data_files="data/gsm8k_test_alpaca.json", split="test")
+    # data_files must be a dict here: passing a bare string/list always
+    # names the resulting split "train", regardless of the file's content,
+    # so split="test" would fail to find anything.
+    dataset = load_dataset(
+        "json", data_files={"test": "data/gsm8k_test_alpaca.json"}, split="test"
+    )
     
     dataset = dataset.select(range(min(n_examples, len(dataset))))
 
