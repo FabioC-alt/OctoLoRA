@@ -35,6 +35,7 @@ src/
   evaluate.py  # Reloads a checkpoint and scores it on the GSM8K test set
 scripts/
   submit_octolora.sh   # SLURM batch script for the training run
+  submit_evaluate.sh   # SLURM batch script for scoring a checkpoint on GSM8K
   check_vocab_size.py  # Diagnostic: compares tokenizer vs model vocab size
 data/
   gsm8k_train_alpaca.json  # Training set, alpaca-style fields
@@ -62,10 +63,14 @@ not the case before this pass; see "Bugs found and fixed" below.
 ```bash
 pip install -r requirements.txt
 # on the cluster:
-sbatch scripts/submit_octolora.sh
-# locally, once trained:
-python src/evaluate.py
+sbatch scripts/submit_octolora.sh    # training
+sbatch scripts/submit_evaluate.sh    # evaluation, once a checkpoint exists
 ```
+
+Before running `submit_evaluate.sh`, check which checkpoint directory
+training actually produced (`ls results/octo_lora_plus/`) and update
+`CHECKPOINT_PATH` at the top of `src/evaluate.py` to match — the number in
+that path depends on your dataset size and batch config.
 
 Secrets are read from the environment, not hardcoded:
 
