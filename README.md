@@ -42,6 +42,7 @@ src/
 scripts/
   submit_octolora.sh   # SLURM batch script for the training run
   submit_evaluate.sh   # SLURM batch script for scoring a checkpoint on GSM8K
+  run_ablation.sh      # Submits all 4 ablation variants as one chained SLURM pipeline
   check_vocab_size.py  # Diagnostic: compares tokenizer vs model vocab size
 data/
   gsm8k_train_alpaca.json  # Training set, alpaca-style fields
@@ -104,10 +105,28 @@ sbatch scripts/submit_octolora.sh                                  # OctoLoRA (d
 
 Each run writes to its own `results/<variant>/` directory and drops an
 `octolora_run_config.json` there recording exactly which flags were used, so
-`src/evaluate.py --checkpoint results/<variant>/checkpoint-N` always
-reconstructs the matching architecture automatically. Run each variant with
-a few different seeds (`SEED` at the top of `train.py`) before comparing —
-GSM8K accuracy has real run-to-run noise on a dataset this size.
+`src/evaluate.py --checkpoint results/<variant>` always reconstructs the
+matching architecture automatically (it auto-picks the highest-step
+`checkpoint-N` inside that directory). Run each variant with a few
+different seeds (`SEED` at the top of `train.py`) before comparing — GSM8K
+accuracy has real run-to-run noise on a dataset this size.
+
+**Or run the whole sweep with one command:**
+
+```bash
+bash scripts/run_ablation.sh          # full 1319-example test set for eval
+bash scripts/run_ablation.sh 200      # faster: evaluate only 200 examples
+```
+
+This submits all four training jobs and their evaluations as a single SLURM
+dependency chain (`--dependency=afterok:...`) — each variant's evaluation
+only starts once its training succeeds, and the next variant's training only
+starts once the previous variant's evaluation succeeds, so they run one at a
+time in order instead of competing for the same GPU. Track it with `squeue
+-u $USER`; each variant's final accuracy shows up in
+`OctoLoRAEval-<job_id>.out` once its evaluation job completes. If any job in
+the chain fails, SLURM automatically cancels the rest instead of continuing
+on bad state.
 
 Secrets are read from the environment, not hardcoded:
 

@@ -89,6 +89,28 @@ def inject_octo_lora(model, rank=16, alpha=32, target_modules=None, use_gate=Tru
     return model
 
 
+def resolve_checkpoint(path: str) -> str:
+    """Accepts either a specific checkpoint-N directory or a run's output_dir
+    (e.g. results/vanilla_lora) and returns the actual checkpoint directory,
+    picking the highest-step checkpoint-N subdirectory if given the latter.
+    """
+    has_weights = os.path.exists(os.path.join(path, "model.safetensors")) or \
+        os.path.exists(os.path.join(path, "pytorch_model.bin"))
+    if has_weights:
+        return path
+
+    candidates = [
+        d for d in os.listdir(path)
+        if d.startswith("checkpoint-") and os.path.isdir(os.path.join(path, d))
+    ] if os.path.isdir(path) else []
+    if not candidates:
+        raise FileNotFoundError(
+            f"{path} has no model weights and no checkpoint-N subdirectories"
+        )
+    latest = max(candidates, key=lambda d: int(d.split("-")[-1]))
+    return os.path.join(path, latest)
+
+
 # --- 1. EVALUATION UTILS ---
 def extract_answer(text: str) -> str | None:
     match = re.search(r"####\s*([\d,.-]+)", text)
@@ -160,7 +182,7 @@ if __name__ == "__main__":
         help=f"Path to the checkpoint directory to evaluate (default: {CHECKPOINT_PATH})",
     )
     args = parser.parse_args()
-    checkpoint_path = args.checkpoint
+    checkpoint_path = resolve_checkpoint(args.checkpoint)
 
     # Runs produced by the ablation-aware train.py write octolora_run_config.json
     # alongside the checkpoint (in the run's output_dir, one level up from a
