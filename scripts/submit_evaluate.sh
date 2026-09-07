@@ -6,7 +6,11 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=02:00:00
+#SBATCH --time=12:00:00
+# Evaluating the full 1319-example GSM8K test set with unbatched greedy
+# generation (up to 256 new tokens each) is slow; 12h is a conservative
+# upper bound. Pass a smaller count as the first sbatch argument to test
+# faster, e.g. `sbatch scripts/submit_evaluate.sh 200`.
 
 set -e
 
@@ -42,4 +46,10 @@ echo "Starting evaluation..."
 cd /scratch.hpc/fabio.ciraci2/OctoLoRA
 source .venv/bin/activate
 
-python3 src/evaluate.py
+# Optional: sbatch scripts/submit_evaluate.sh <n_examples> to evaluate a
+# subset instead of the full test file.
+if [[ -n "$1" ]]; then
+    python3 src/evaluate.py --n-examples "$1"
+else
+    python3 src/evaluate.py
+fi

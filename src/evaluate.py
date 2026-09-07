@@ -1,4 +1,4 @@
-import sys
+import argparse
 import json
 import os
 import torch
@@ -96,11 +96,13 @@ def extract_answer(text: str) -> str | None:
     return numbers[-1].replace(",", "") if numbers else None
 
 
-def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda", data_path="data"):
+def evaluate_gsm8k(model, tokenizer, n_examples=None, device="cuda", data_path="data"):
+    """n_examples=None evaluates the entire test file."""
     print("Loading local evaluation dataset...", flush=True)
     with open(os.path.join(data_path, "gsm8k_test_alpaca.json")) as f:
         dataset = json.load(f)
-    dataset = dataset[:min(n_examples, len(dataset))]
+    if n_examples is not None:
+        dataset = dataset[:min(n_examples, len(dataset))]
     print(f"Loaded {len(dataset)} examples. Starting live generation loops...", flush=True)
 
     model.eval()
@@ -143,6 +145,15 @@ def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda", data_path="d
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate an OctoLoRA checkpoint on GSM8K")
+    parser.add_argument(
+        "--n-examples",
+        type=int,
+        default=None,
+        help="Number of test examples to evaluate (default: all 1319)",
+    )
+    args = parser.parse_args()
+
     print("Initializing components...", flush=True)
     print("Loading tokenizer...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, clean_up_tokenization_spaces=False)
@@ -173,4 +184,4 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Could not locate training checkpoint files in {CHECKPOINT_PATH}")
 
     print("Framework generation completed. Starting evaluation pipeline...", flush=True)
-    evaluate_gsm8k(model, tokenizer, n_examples=200)
+    evaluate_gsm8k(model, tokenizer, n_examples=args.n_examples)
