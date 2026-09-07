@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import torch
 import torch.nn as nn
 from datasets import load_dataset
@@ -24,6 +25,7 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
+    TrainerCallback,
     DataCollatorForSeq2Seq,
 )
 
@@ -174,6 +176,30 @@ def inject_octo_lora(model, rank=16, alpha=32, target_modules=None, use_gate=Tru
     return model
 
 
+class GateStatsCallback(TrainerCallback):
+    """Logs how far the gate's a_weight actually drifts from 1.0 (full,
+    ungated gradient flow) across all gated layers, at the same cadence as
+    the normal training-loss logs. If a_weight never leaves ~1.0, the gate
+    isn't doing anything distinguishable from not having it at all.
+    """
+
+    def __init__(self, model):
+        self.gated_layers = [m for m in model.modules() if isinstance(m, OctoLoRALayer) and m.use_gate]
+
+    def on_log(self, args, state, control, **kwargs):
+        if not self.gated_layers:
+            return
+        a_weights = []
+        for layer in self.gated_layers:
+            total = layer.grad_norm_A + layer.grad_norm_B + 1e-8
+            a_weight = (layer.grad_norm_B / total).clamp(0.1, 1.0)
+            a_weights.append(a_weight.item())
+        logger.info(
+            "[Gate stats] step=%d mean_a_weight=%.4f min=%.4f max=%.4f (n_layers=%d)",
+            state.global_step, statistics.mean(a_weights), min(a_weights), max(a_weights), len(a_weights),
+        )
+
+
 # ─────────────────────────────────────────────────────────────
 # 4. CUSTOM HUGGINGFACE TRAINER FOR LORA+ INTEGRATION
 # ─────────────────────────────────────────────────────────────
@@ -181,8 +207,9 @@ def inject_octo_lora(model, rank=16, alpha=32, target_modules=None, use_gate=Tru
 class OctoLoraPlusTrainer(Trainer):
     """Custom Trainer subclass overriding optimizer creation and forcing strict tensor safety."""
 
-    def __init__(self, *args, use_lora_plus=True, **kwargs):
+    def __init__(self, *args, use_lora_plus=True, b_lr_ratio=16.0, **kwargs):
         self.use_lora_plus = use_lora_plus
+        self.b_lr_ratio = b_lr_ratio
         super().__init__(*args, **kwargs)
 
     def create_optimizer(self):
@@ -191,7 +218,7 @@ class OctoLoraPlusTrainer(Trainer):
                 self.model,
                 lr=self.args.learning_rate,
                 use_lora_plus=self.use_lora_plus,
-                b_lr_ratio=B_LR_RATIO,
+                b_lr_ratio=self.b_lr_ratio,
                 weight_decay=self.args.weight_decay
             )
         return self.optimizer
@@ -394,33 +421,49 @@ def parse_args():
              "--lora-plus false uses a single flat learning rate for all trainable params.",
     )
     parser.add_argument(
+        "--b-lr-ratio", type=float, default=B_LR_RATIO,
+        help=f"LoRA+ B-matrix learning-rate multiplier (default: {B_LR_RATIO}). "
+             "Only matters when --lora-plus is on. Lower this to test whether the "
+             "default ratio is too aggressive and overfitting the training set.",
+    )
+    parser.add_argument(
         "--output-dir", default=None,
-        help="Override the checkpoint output directory (default: derived from --gate/--lora-plus).",
+        help="Override the checkpoint output directory (default: derived from --gate/--lora-plus/--b-lr-ratio).",
     )
     return parser.parse_args()
 
 
-def variant_name(use_gate, use_lora_plus):
+def variant_name(use_gate, use_lora_plus, b_lr_ratio=B_LR_RATIO):
     if use_gate and use_lora_plus:
-        return "octo_lora_plus"
-    if use_lora_plus:
-        return "lora_plus_only"
-    if use_gate:
+        name = "octo_lora_plus"
+    elif use_lora_plus:
+        name = "lora_plus_only"
+    elif use_gate:
         return "gate_only"
-    return "vanilla_lora"
+    else:
+        return "vanilla_lora"
+    if b_lr_ratio != B_LR_RATIO:
+        name += f"_blr{b_lr_ratio:g}"
+    return name
 
 
 if __name__ == "__main__":
     args = parse_args()
     torch.manual_seed(SEED)
 
-    output_dir = args.output_dir or f"./results/{variant_name(args.gate, args.lora_plus)}"
-    logger.info("Run variant: gate=%s lora_plus=%s -> output_dir=%s", args.gate, args.lora_plus, output_dir)
+    output_dir = args.output_dir or f"./results/{variant_name(args.gate, args.lora_plus, args.b_lr_ratio)}"
+    logger.info(
+        "Run variant: gate=%s lora_plus=%s b_lr_ratio=%s -> output_dir=%s",
+        args.gate, args.lora_plus, args.b_lr_ratio, output_dir,
+    )
 
     # Persist the run config alongside the checkpoints so evaluate.py can
     # reconstruct the exact same architecture later without guessing.
     os.makedirs(output_dir, exist_ok=True)
-    run_config = {"use_gate": args.gate, "use_lora_plus": args.lora_plus, "rank": RANK, "alpha": ALPHA}
+    run_config = {
+        "use_gate": args.gate, "use_lora_plus": args.lora_plus,
+        "b_lr_ratio": args.b_lr_ratio, "rank": RANK, "alpha": ALPHA,
+    }
     with open(os.path.join(output_dir, "octolora_run_config.json"), "w") as f:
         json.dump(run_config, f, indent=2)
 
@@ -472,8 +515,12 @@ if __name__ == "__main__":
         train_dataset=train_data,
         data_collator=DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, label_pad_token_id=-100),
         use_lora_plus=args.lora_plus,
+        b_lr_ratio=args.b_lr_ratio,
     )
-    
+    if args.gate:
+        trainer.add_callback(GateStatsCallback(model))
+
+
     logger.info("Beginning fine-tuning engine pass...")
     trainer.train()
     

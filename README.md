@@ -142,6 +142,49 @@ push protection will reject a commit that contains a live token, but the
 safest approach is to just never type a real token into a file under
 version control.
 
+### Diagnosing *why* a variant wins or loses
+
+- **`--b-lr-ratio <float>`** overrides `B_LR_RATIO` (default 16.0) for a
+  single run, e.g. `sbatch scripts/submit_octolora.sh --b-lr-ratio 4`. Use
+  this to test whether LoRA+'s default ratio is too aggressive for this
+  model/rank/task (see "Results" below — that's exactly what happened on
+  the first sweep). Runs with a non-default ratio get their own
+  `results/<variant>_blr<ratio>/` directory so they don't collide with the
+  default-ratio runs.
+- When `--gate` is on, training also logs `[Gate stats] step=... mean_a_weight=...
+  min=... max=...` at the same cadence as the normal loss logs
+  (`GateStatsCallback` in `train.py`). `a_weight` is clamped to `[0.1, 1.0]`;
+  if it sits at/near `1.0` for the whole run, the gate is behaving like "no
+  gate" and isn't a plausible explanation for any accuracy difference you
+  see — check this before attributing an effect to the gate.
+
+## Results (first sweep, single seed, rank 16 / alpha 32 / 3 epochs)
+
+| variant | final train loss | GSM8K accuracy (1319 examples) |
+|---|---|---|
+| `vanilla_lora` | 0.744 | **72.71%** |
+| `lora_plus_only` | 0.660 | 70.96% |
+| `gate_only` | 0.744 | 71.72% |
+| `octo_lora_plus` | 0.662 | 68.92% |
+
+Plain LoRA won. Two findings from comparing loss curves, not just final
+accuracy:
+
+- **LoRA+ variants fit training data better but generalize worse** — a
+  textbook overfitting signature, most likely because `B_LR_RATIO=16` gives
+  `B` an effective learning rate of `3.2e-3`, too aggressive for this
+  setup. Untested yet: rerun with `--b-lr-ratio 4` or `8` (see above) — if
+  accuracy improves without the loss dropping as far, that confirms it.
+- **The gate's loss/grad-norm curves are step-for-step nearly identical to
+  its non-gated counterpart** (`gate_only` vs `vanilla_lora`, `octo_lora_plus`
+  vs `lora_plus_only`), suggesting `a_weight` isn't leaving its ceiling near
+  `1.0` in this configuration — i.e. the gate may not be doing anything
+  distinguishable from having no gate at all. `GateStatsCallback` (above)
+  was added specifically to check this directly instead of inferring it
+  from loss curves.
+- **This is one seed per variant.** None of the above should be treated as
+  settled until each variant is repeated with 2-3 different `SEED` values.
+
 ## Bugs found and fixed in this pass
 
 1. **Training never saw the real question (the main reason the model
