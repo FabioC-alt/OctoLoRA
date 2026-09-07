@@ -16,7 +16,13 @@ echo "Skipping cluster modules..."
 # 2. Activate your local python virtual environment
 source /scratch.hpc/fabio.ciraci2/OctoLoRA/.venv/bin/activate
 
-# 3. Environment Variables for Hugging Face (Put your token below!)
+# 3. Environment Variables for Hugging Face.
+# HF_TOKEN must NOT be hardcoded here - export it once in your shell
+# profile (~/.bashrc) or a local, untracked .env before running sbatch.
+# transformers/huggingface_hub picks up HF_TOKEN automatically.
+if [[ -z "$HF_TOKEN" ]]; then
+    echo "WARNING: HF_TOKEN is not set; gated model downloads will fail unless the cache is already populated." >&2
+fi
 export HF_HOME="/scratch.hpc/fabio.ciraci2/OctoLoRA/.cache"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1

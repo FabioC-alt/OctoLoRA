@@ -70,9 +70,16 @@ python src/evaluate.py
 Secrets are read from the environment, not hardcoded:
 
 ```bash
+export HF_TOKEN=...             # required to download the gated Llama-3.1 model
 export TELEGRAM_BOT_TOKEN=...   # optional, for the completion notification
 export TELEGRAM_CHAT_ID=...
 ```
+
+Set these in your shell profile (`~/.bashrc`) or a local, untracked `.env`
+you `source` before `sbatch` — never inside a committed script. GitHub's
+push protection will reject a commit that contains a live token, but the
+safest approach is to just never type a real token into a file under
+version control.
 
 ## Bugs found and fixed in this pass
 
