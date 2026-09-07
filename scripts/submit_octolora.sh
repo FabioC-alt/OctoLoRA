@@ -16,10 +16,16 @@ echo "Skipping cluster modules..."
 # 2. Activate your local python virtual environment
 source /scratch.hpc/fabio.ciraci2/OctoLoRA/.venv/bin/activate
 
+# 2b. Load local secrets (HF_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+# from an untracked .env file - never commit real values, only this
+# loading line. See .gitignore: .env / *.env are excluded from git.
+if [[ -f /scratch.hpc/fabio.ciraci2/OctoLoRA/.env ]]; then
+    source /scratch.hpc/fabio.ciraci2/OctoLoRA/.env
+fi
+
 # 3. Environment Variables for Hugging Face.
-# HF_TOKEN must NOT be hardcoded here - export it once in your shell
-# profile (~/.bashrc) or a local, untracked .env before running sbatch.
-# transformers/huggingface_hub picks up HF_TOKEN automatically.
+# HF_TOKEN must NOT be hardcoded here - it comes from the .env sourced
+# above. transformers/huggingface_hub picks up HF_TOKEN automatically.
 if [[ -z "$HF_TOKEN" ]]; then
     echo "WARNING: HF_TOKEN is not set; gated model downloads will fail unless the cache is already populated." >&2
 fi
