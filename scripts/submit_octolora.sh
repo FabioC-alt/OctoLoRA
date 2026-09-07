@@ -3,7 +3,7 @@
 #SBATCH --output=OctoLoRAX.out
 #SBATCH --error=OctoLoRAX.err
 #SBATCH --partition=l40s
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=08:00:00
