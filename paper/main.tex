@@ -452,10 +452,11 @@ objection is that an explicit gradient-norm gate should be redundant with
 this. Our ablation does not resolve this question — it shows the gate has
 a measurable, seed-robust effect at sane ratios, not why that effect
 exists beyond Adam's own adaptivity. The $a_{\text{weight}}$ trajectory
-(Section~\ref{sec:results}, and drifting rather than static in our
-measurements) is consistent with the gate tracking a per-layer imbalance
-Adam's per-parameter (not per-layer, not $A$-vs-$B$-relative) statistics
-do not directly represent, but we regard this as a hypothesis for future
+(Section~\ref{sec:results}), which drifts over training rather than
+sitting at a static value, is consistent with the gate tracking a
+per-layer imbalance that Adam's per-parameter (not per-layer, not
+$A$-vs-$B$-relative) statistics do not directly represent, but we regard
+this as a hypothesis for future
 mechanistic work, not something established here.
 
 \paragraph{Honest comparison to the state of the art.} LoRA-RITE's
