@@ -160,32 +160,43 @@ version control.
   gate" and isn't a plausible explanation for any accuracy difference you
   see — check this before attributing an effect to the gate.
 
-## Results (first sweep, single seed, rank 16 / alpha 32 / 3 epochs)
+## Results
 
-| variant | final train loss | GSM8K accuracy (1319 examples) |
-|---|---|---|
-| `vanilla_lora` | 0.744 | **72.71%** |
-| `lora_plus_only` | 0.660 | 70.96% |
-| `gate_only` | 0.744 | 71.72% |
-| `octo_lora_plus` | 0.662 | 68.92% |
+**Headline result, seed-confirmed:** `octo_lora_plus` (gate + LoRA+) beats
+plain LoRA on GSM8K by ~1.3pp on average, robustly across 3 seeds with
+non-overlapping ranges — but only once `B_LR_RATIO` is corrected from the
+hardcoded default of 16 down to **2**. At the default ratio, the same
+combined method *loses* to plain LoRA by nearly 4pp. The full
+investigation — first sweep, the `B_LR_RATIO` curve that found this, gate
+diagnostics, noise-floor calibration, and the seed confirmation — is
+written up in detail on the Desktop (`OctoLoRA_README.md` and
+`OctoLoRA_related_work_comparison.md`); short version:
 
-Plain LoRA won. Two findings from comparing loss curves, not just final
-accuracy:
+| config | seed 42 | seed 123 | seed 7 | mean |
+|---|---|---|---|---|
+| `vanilla_lora` | 72.71% | 72.33% | 71.27% | 72.10% |
+| `octo_lora_plus --b-lr-ratio 2` | 73.31% | 73.24% | 73.62% | **73.39%** |
 
-- **LoRA+ variants fit training data better but generalize worse** — a
-  textbook overfitting signature, most likely because `B_LR_RATIO=16` gives
-  `B` an effective learning rate of `3.2e-3`, too aggressive for this
-  setup. Untested yet: rerun with `--b-lr-ratio 4` or `8` (see above) — if
-  accuracy improves without the loss dropping as far, that confirms it.
-- **The gate's loss/grad-norm curves are step-for-step nearly identical to
-  its non-gated counterpart** (`gate_only` vs `vanilla_lora`, `octo_lora_plus`
-  vs `lora_plus_only`), suggesting `a_weight` isn't leaving its ceiling near
-  `1.0` in this configuration — i.e. the gate may not be doing anything
-  distinguishable from having no gate at all. `GateStatsCallback` (above)
-  was added specifically to check this directly instead of inferring it
-  from loss curves.
-- **This is one seed per variant.** None of the above should be treated as
-  settled until each variant is repeated with 2-3 different `SEED` values.
+The original single-ratio sweep (`--b-lr-ratio 16`, the pre-existing
+default) told the opposite story — plain LoRA beat every variant involving
+LoRA+ or the gate, because the LoRA+ variants were **overfitting**
+(reaching lower training loss but worse test accuracy). That turned out to
+be a hyperparameter problem, not a problem with the underlying ideas: see
+the Desktop write-up for the full curve (`B_LR_RATIO` = 2, 4, 8, 16) and the
+gate-instrumentation work (`GateStatsCallback`) that also corrected an
+earlier wrong assumption that the gate was inert.
+
+**Related work check**: LoRA-RITE (arXiv:2410.20625) and ALLoRA
+(arXiv:2410.09692) target the same A/B-imbalance problem this gate does,
+with more principled mechanisms — LoRA-RITE reports a verified +7pp GSM8K
+gain over Adam, several times this project's effect size. See
+`OctoLoRA_related_work_comparison.md` on the Desktop for the full
+comparison and what it means for how this result should be framed in a
+paper.
+
+**Still open**: only the headline comparison (`vanilla_lora` vs.
+`octo_lora_plus_blr2`) has 3-seed confirmation; the rest of the ablation
+table is still single-seed. Single task (GSM8K), single model (Llama-3.1-8B).
 
 ## Bugs found and fixed in this pass
 
