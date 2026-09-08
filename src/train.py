@@ -427,34 +427,42 @@ def parse_args():
              "default ratio is too aggressive and overfitting the training set.",
     )
     parser.add_argument(
+        "--seed", type=int, default=SEED,
+        help=f"Random seed for init/data order/Trainer (default: {SEED}). "
+             "Use a different value per run when checking whether a result "
+             "holds up across seeds rather than being a lucky single run.",
+    )
+    parser.add_argument(
         "--output-dir", default=None,
-        help="Override the checkpoint output directory (default: derived from --gate/--lora-plus/--b-lr-ratio).",
+        help="Override the checkpoint output directory (default: derived from --gate/--lora-plus/--b-lr-ratio/--seed).",
     )
     return parser.parse_args()
 
 
-def variant_name(use_gate, use_lora_plus, b_lr_ratio=B_LR_RATIO):
+def variant_name(use_gate, use_lora_plus, b_lr_ratio=B_LR_RATIO, seed=SEED):
     if use_gate and use_lora_plus:
         name = "octo_lora_plus"
     elif use_lora_plus:
         name = "lora_plus_only"
     elif use_gate:
-        return "gate_only"
+        name = "gate_only"
     else:
-        return "vanilla_lora"
+        name = "vanilla_lora"
     if b_lr_ratio != B_LR_RATIO:
         name += f"_blr{b_lr_ratio:g}"
+    if seed != SEED:
+        name += f"_seed{seed}"
     return name
 
 
 if __name__ == "__main__":
     args = parse_args()
-    torch.manual_seed(SEED)
+    torch.manual_seed(args.seed)
 
-    output_dir = args.output_dir or f"./results/{variant_name(args.gate, args.lora_plus, args.b_lr_ratio)}"
+    output_dir = args.output_dir or f"./results/{variant_name(args.gate, args.lora_plus, args.b_lr_ratio, args.seed)}"
     logger.info(
-        "Run variant: gate=%s lora_plus=%s b_lr_ratio=%s -> output_dir=%s",
-        args.gate, args.lora_plus, args.b_lr_ratio, output_dir,
+        "Run variant: gate=%s lora_plus=%s b_lr_ratio=%s seed=%s -> output_dir=%s",
+        args.gate, args.lora_plus, args.b_lr_ratio, args.seed, output_dir,
     )
 
     # Persist the run config alongside the checkpoints so evaluate.py can
@@ -462,7 +470,7 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
     run_config = {
         "use_gate": args.gate, "use_lora_plus": args.lora_plus,
-        "b_lr_ratio": args.b_lr_ratio, "rank": RANK, "alpha": ALPHA,
+        "b_lr_ratio": args.b_lr_ratio, "seed": args.seed, "rank": RANK, "alpha": ALPHA,
     }
     with open(os.path.join(output_dir, "octolora_run_config.json"), "w") as f:
         json.dump(run_config, f, indent=2)
@@ -503,7 +511,7 @@ if __name__ == "__main__":
         eval_strategy="no",      
         warmup_ratio=0.05,
         lr_scheduler_type="cosine",
-        seed=SEED,
+        seed=args.seed,
         remove_unused_columns=False,
         report_to="none",
     )
