@@ -11,6 +11,8 @@ Instead of using an existing PEFT/LoRA library, `src/train.py` implements its
 own adapter layer, `OctoLoRALayer`, which replaces the attention projections
 (`q_proj`, `v_proj`, `k_proj`, `o_proj`) of the frozen base model:
 
+![How OctoLoRA's gate works: the forward pass is identical across plain LoRA, LoRA+, and OctoLoRA; only how much each training step updates A vs. B differs.](docs/octolora_mechanism.svg)
+
 - Each layer adds a low-rank `B(A(x))` update on top of the frozen base
   projection, as in standard LoRA.
 - **The gate is not a Mixture-of-Experts / routing mechanism**, despite the
