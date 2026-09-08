@@ -1,8 +1,9 @@
 """
 OctoLoRA Training Pipeline with LoRA+ Optimizer on GSM8K
 --------------------------------------------------------
-Implements gradient-norm-driven adaptive routing (OctoLoRA)
-combined with separate parameter group learning rates (LoRA+).
+GSM8K-specific data loading, evaluation, and CLI. The shared adapter
+architecture, optimizer, and Trainer live in octolora_core.py - see that
+module's docstring for why they're factored out.
 
 Supports ablating the two ideas independently via --gate/--lora-plus,
 so the same script can produce the vanilla-LoRA, LoRA+-only,
@@ -11,250 +12,42 @@ contributes.
 """
 
 import argparse
-import functools
 import json
-import logging
 import os
 import re
-import statistics
+
 import torch
-import torch.nn as nn
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     TrainingArguments,
-    Trainer,
-    TrainerCallback,
     DataCollatorForSeq2Seq,
 )
 
-# ─────────────────────────────────────────────────────────────
-# 1. MAIN CONFIG
-# ─────────────────────────────────────────────────────────────
-
-MODEL_ID    = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-RANK        = 16          
-ALPHA       = 32          
-MAX_LEN     = 512         
-BATCH_SIZE  = 4
-GRAD_ACCUM  = 8           # effective batch = 32
-SEED        = 42
-EPOCHS      = 3
-
-# Learning Rate Configurations (LoRA+)
-BASE_LR     = 2e-4
-B_LR_RATIO  = 16.0        # B matrices will train with BASE_LR * B_LR_RATIO
-
-# Configure Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+from octolora_core import (
+    ALPHA,
+    BASE_LR,
+    B_LR_RATIO,
+    MODEL_ID,
+    RANK,
+    SEED,
+    GateStatsCallback,
+    OctoLoraPlusTrainer,
+    inject_octo_lora,
+    logger,
+    make_forward_safe,
+    variant_name,
 )
-logger = logging.getLogger(__name__)
+
+MAX_LEN    = 512
+BATCH_SIZE = 4
+GRAD_ACCUM = 8  # effective batch = 32
+EPOCHS     = 3
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. OPTION 1: LoRA+ OPTIMIZER BUILDER
-# ─────────────────────────────────────────────────────────────
-
-def build_optimizer(model, lr=2e-4, use_lora_plus=True, b_lr_ratio=16.0, weight_decay=0.0):
-    """
-    If use_lora_plus, splits trainable weights into A/B parameter groups
-    with different learning rates (LoRA+). Otherwise builds a single-group
-    AdamW at a flat lr, i.e. plain LoRA optimization - the ablation
-    baseline for isolating what LoRA+ contributes on its own.
-    """
-    if not use_lora_plus:
-        params = [p for p in model.parameters() if p.requires_grad]
-        logger.info("Plain optimizer built: single LR = %e for all trainable params", lr)
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-
-    a_params, b_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if name.endswith("A.weight"):
-            a_params.append(param)
-        elif name.endswith("B.weight"):
-            b_params.append(param)
-
-    optimizer_grouped_parameters = [
-        {"params": a_params, "lr": lr},
-        {"params": b_params, "lr": lr * b_lr_ratio},
-    ]
-
-    logger.info(
-        "LoRA+ Optimizer built: Matrix A LR = %e, Matrix B LR = %e",
-        lr, lr * b_lr_ratio
-    )
-    return torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=weight_decay)
-
-
-# ─────────────────────────────────────────────────────────────
-# 3. OPTION 2: GRADIENT-AWARE OCTO LORA LAYER
-# ─────────────────────────────────────────────────────────────
-
-class OctoLoRALayer(nn.Module):
-    def __init__(self, base_layer: nn.Linear, rank: int = 16, alpha: float = 32, use_gate: bool = True):
-        super().__init__()
-        in_dim = base_layer.in_features
-        out_dim = base_layer.out_features
-
-        self.base = base_layer
-        self.base.requires_grad_(False)
-
-        self.A = nn.Linear(in_dim, rank, bias=False)
-        self.B = nn.Linear(rank, out_dim, bias=False)
-        self.scale = alpha / rank
-        self.use_gate = use_gate
-
-        nn.init.kaiming_uniform_(self.A.weight, a=5**0.5)
-        nn.init.zeros_(self.B.weight)
-
-        if self.use_gate:
-            # Track historical backward scaling safely using persistent buffers
-            self.register_buffer("grad_norm_A", torch.tensor(1.0))
-            self.register_buffer("grad_norm_B", torch.tensor(1.0))
-            self.ema = 0.9
-
-            self.A.weight.register_hook(self._make_grad_hook("A"))
-            self.B.weight.register_hook(self._make_grad_hook("B"))
-
-    def _make_grad_hook(self, which):
-        def hook(grad):
-            norm = grad.detach().norm()
-            target = self.grad_norm_A if which == "A" else self.grad_norm_B
-            target.mul_(self.ema).add_(norm, alpha=1 - self.ema)
-            return grad
-        return hook
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = self.base(x)
-        mid = self.A(x)
-
-        if self.use_gate:
-            # Continuous adaptive routing calculation based on gradient histories
-            total = self.grad_norm_A + self.grad_norm_B + 1e-8
-            a_weight = (self.grad_norm_B / total).clamp(0.1, 1.0)
-            # Scaled gradient gate flow management
-            mid = mid * a_weight + mid.detach() * (1 - a_weight)
-
-        adapter = self.B(mid) * self.scale
-        return base_out + adapter
-
-def inject_octo_lora(model, rank=16, alpha=32, target_modules=None, use_gate=True):
-    if target_modules is None:
-        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
-
-    model.requires_grad_(False)
-
-    targets = [
-        (name, module)
-        for name, module in model.named_modules()
-        if isinstance(module, nn.Linear) and any(t in name for t in target_modules)
-    ]
-
-    replaced = 0
-    for name, module in targets:
-        parts = name.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        attr = parts[-1]
-
-        device, dtype = module.weight.device, module.weight.dtype
-        octo = OctoLoRALayer(module, rank=rank, alpha=alpha, use_gate=use_gate).to(device=device, dtype=dtype)
-        octo.A.weight.requires_grad_(True)
-        octo.B.weight.requires_grad_(True)
-
-        setattr(parent, attr, octo)
-        replaced += 1
-
-    logger.info("[OctoLoRA] Replaced %d layers with OctoLoRALayer (gate=%s)", replaced, use_gate)
-    return model
-
-
-class GateStatsCallback(TrainerCallback):
-    """Logs how far the gate's a_weight actually drifts from 1.0 (full,
-    ungated gradient flow) across all gated layers, at the same cadence as
-    the normal training-loss logs. If a_weight never leaves ~1.0, the gate
-    isn't doing anything distinguishable from not having it at all.
-    """
-
-    def __init__(self, model):
-        self.gated_layers = [m for m in model.modules() if isinstance(m, OctoLoRALayer) and m.use_gate]
-
-    def on_log(self, args, state, control, **kwargs):
-        if not self.gated_layers:
-            return
-        a_weights = []
-        for layer in self.gated_layers:
-            total = layer.grad_norm_A + layer.grad_norm_B + 1e-8
-            a_weight = (layer.grad_norm_B / total).clamp(0.1, 1.0)
-            a_weights.append(a_weight.item())
-        logger.info(
-            "[Gate stats] step=%d mean_a_weight=%.4f min=%.4f max=%.4f (n_layers=%d)",
-            state.global_step, statistics.mean(a_weights), min(a_weights), max(a_weights), len(a_weights),
-        )
-
-
-# ─────────────────────────────────────────────────────────────
-# 4. CUSTOM HUGGINGFACE TRAINER FOR LORA+ INTEGRATION
-# ─────────────────────────────────────────────────────────────
-
-class OctoLoraPlusTrainer(Trainer):
-    """Custom Trainer subclass overriding optimizer creation and forcing strict tensor safety."""
-
-    def __init__(self, *args, use_lora_plus=True, b_lr_ratio=16.0, **kwargs):
-        self.use_lora_plus = use_lora_plus
-        self.b_lr_ratio = b_lr_ratio
-        super().__init__(*args, **kwargs)
-
-    def create_optimizer(self):
-        if self.optimizer is None:
-            self.optimizer = build_optimizer(
-                self.model,
-                lr=self.args.learning_rate,
-                use_lora_plus=self.use_lora_plus,
-                b_lr_ratio=self.b_lr_ratio,
-                weight_decay=self.args.weight_decay
-            )
-        return self.optimizer
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Intercepts and sanitizes both input_ids and labels to prevent GPU out-of-bounds crashes."""
-        vocab_size = model.config.vocab_size  # 128256
-
-        # 1. Sanitize input_ids (Embedding layer protection)
-        if "input_ids" in inputs:
-            input_ids = inputs["input_ids"]
-            # Clamp any rogue token ID to a safe, valid index (like pad/eos token 128001 or 0)
-            bad_input_mask = (input_ids < 0) | (input_ids >= vocab_size)
-            if bad_input_mask.any():
-                inputs["input_ids"] = torch.where(
-                    bad_input_mask,
-                    torch.tensor(0, device=input_ids.device),
-                    input_ids
-                )
-
-        # 2. Sanitize labels (Cross-entropy loss protection)
-        if "labels" in inputs:
-            labels = inputs["labels"]
-            bad_label_mask = (labels >= vocab_size) | ((labels < 0) & (labels != -100))
-            if bad_label_mask.any():
-                inputs["labels"] = torch.where(
-                    bad_label_mask,
-                    torch.tensor(-100, device=labels.device),
-                    labels
-                )
-
-        # Proceed safely to standard Hugging Face forward pass execution
-        return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
-
-# ─────────────────────────────────────────────────────────────
-# 5. GSM8K DATA & EVALUATION PIPELINES
+# GSM8K DATA & EVALUATION PIPELINES
 # ─────────────────────────────────────────────────────────────
 
 def load_gsm8k(tokenizer, data_files, split="train", max_len=MAX_LEN):
@@ -279,11 +72,11 @@ def load_gsm8k(tokenizer, data_files, split="train", max_len=MAX_LEN):
             {"role": "assistant", "content": output}
         ]
         full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
-        
+
         tokenized = tokenizer(
             full_prompt, truncation=True, max_length=max_len, padding=False
         )
-        
+
         input_ids = tokenized["input_ids"]
         labels = input_ids.copy()
 
@@ -301,12 +94,12 @@ def load_gsm8k(tokenizer, data_files, split="train", max_len=MAX_LEN):
 
     # Map dataset and completely drop old raw columns
     mapped_dataset = dataset.map(format_example, remove_columns=dataset.column_names)
-    
+
     # Strict validation filter: drop any row that somehow ended up empty
     mapped_dataset = mapped_dataset.filter(lambda x: len(x.get("input_ids", [])) > 0)
-    
+
     logger.info("[Dataset Check] Processed dataset features contain keys: %s", list(mapped_dataset[0].keys()))
-    return mapped_dataset        
+    return mapped_dataset
 
 def extract_answer(text: str) -> str | None:
     match = re.search(r"####\s*([\d,.-]+)", text)
@@ -316,44 +109,6 @@ def extract_answer(text: str) -> str | None:
     return numbers[-1].replace(",", "") if numbers else None
 
 
-
-
-def make_forward_safe(model):
-    original_forward = model.forward
-
-    # Using functools.wraps copies the original method name, docstring, 
-    # and critically, the parameter signature over to our wrapper.
-    @functools.wraps(original_forward)
-    def safe_forward(*args, **kwargs):
-        # 1. Sanitize labels context
-        if "labels" in kwargs and kwargs["labels"] is not None:
-            labels = kwargs["labels"]
-            vocab_size = model.config.vocab_size
-            invalid_mask = (labels >= vocab_size) | ((labels < 0) & (labels != -100))
-            if invalid_mask.any():
-                kwargs["labels"] = torch.where(
-                    invalid_mask, 
-                    torch.tensor(-100, device=labels.device), 
-                    labels
-                )
-                
-        # 2. Sanitize input_ids context
-        if "input_ids" in kwargs and kwargs["input_ids"] is not None:
-            input_ids = kwargs["input_ids"]
-            vocab_size = model.config.vocab_size
-            invalid_input_mask = (input_ids < 0) | (input_ids >= vocab_size)
-            if invalid_input_mask.any():
-                kwargs["input_ids"] = torch.where(
-                    invalid_input_mask,
-                    torch.tensor(0, device=input_ids.device),
-                    input_ids
-                )
-
-        return original_forward(*args, **kwargs)
-
-    model.forward = safe_forward
-    return model
-
 def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda"):
     # data_files must be a dict here: passing a bare string/list always
     # names the resulting split "train", regardless of the file's content,
@@ -361,14 +116,14 @@ def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda"):
     dataset = load_dataset(
         "json", data_files={"test": "data/gsm8k_test_alpaca.json"}, split="test"
     )
-    
+
     dataset = dataset.select(range(min(n_examples, len(dataset))))
 
     model.eval()
     correct = 0
 
     for example in dataset:
-        
+
         question = example["instruction"]
 
 
@@ -385,7 +140,7 @@ def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda"):
             output = model.generate(
                 **inputs,
                 max_new_tokens=256,
-                do_sample=False, 
+                do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
 
@@ -405,7 +160,7 @@ def evaluate_gsm8k(model, tokenizer, n_examples=200, device="cuda"):
 
 
 # ─────────────────────────────────────────────────────────────
-# 6. MAIN EXECUTION
+# MAIN EXECUTION
 # ─────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -437,22 +192,6 @@ def parse_args():
         help="Override the checkpoint output directory (default: derived from --gate/--lora-plus/--b-lr-ratio/--seed).",
     )
     return parser.parse_args()
-
-
-def variant_name(use_gate, use_lora_plus, b_lr_ratio=B_LR_RATIO, seed=SEED):
-    if use_gate and use_lora_plus:
-        name = "octo_lora_plus"
-    elif use_lora_plus:
-        name = "lora_plus_only"
-    elif use_gate:
-        name = "gate_only"
-    else:
-        name = "vanilla_lora"
-    if b_lr_ratio != B_LR_RATIO:
-        name += f"_blr{b_lr_ratio:g}"
-    if seed != SEED:
-        name += f"_seed{seed}"
-    return name
 
 
 if __name__ == "__main__":
@@ -504,11 +243,11 @@ if __name__ == "__main__":
         num_train_epochs=EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=BASE_LR,  # Passed down as initial reference for Group A 
+        learning_rate=BASE_LR,  # Passed down as initial reference for Group A
         bf16=True,
         logging_steps=50,
         save_strategy="epoch",
-        eval_strategy="no",      
+        eval_strategy="no",
         warmup_ratio=0.05,
         lr_scheduler_type="cosine",
         seed=args.seed,
@@ -531,9 +270,9 @@ if __name__ == "__main__":
 
     logger.info("Beginning fine-tuning engine pass...")
     trainer.train()
-    
+
     logger.info("Initiating model verification matrix...")
     final_accuracy = evaluate_gsm8k(model, tokenizer)
-    
+
     logger.info("Final Experiment Result Suite Complete.")
     logger.info("OctoLoRA + LoRA+ Balanced Accuracy Output: %.2f%%", final_accuracy * 100)

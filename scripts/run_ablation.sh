@@ -19,12 +19,15 @@ cd "$(dirname "$0")/.."
 
 N_EXAMPLES="$1"
 
-# Refuse to submit a second overlapping sweep: since every variant writes to
-# the same results/<variant>/ path regardless of which sweep invocation
-# started it, two concurrent chains can corrupt each other's checkpoints.
-existing=$(squeue -u "$USER" -h -o "%j" 2>/dev/null | grep -c '^octolora-' || true)
+# Refuse to submit a second overlapping GSM8K sweep: since every variant
+# writes to the same results/<variant>/ path regardless of which sweep
+# invocation started it, two concurrent chains can corrupt each other's
+# checkpoints. Scoped to octolora-gsm8k-* specifically so a concurrent
+# run_ablation_mmlu.sh sweep (a different job-name prefix, writing to
+# separate results/mmlu_*/ paths) isn't blocked by this check.
+existing=$(squeue -u "$USER" -h -o "%j" 2>/dev/null | grep -c '^octolora-gsm8k-' || true)
 if [[ "$existing" -gt 0 ]]; then
-    echo "Found $existing job(s) already queued/running with an octolora-* name for $USER." >&2
+    echo "Found $existing job(s) already queued/running with an octolora-gsm8k-* name for $USER." >&2
     echo "Run 'squeue -u \$USER' to check - if this is a leftover sweep, let it" >&2
     echo "finish or scancel it before starting a new one." >&2
     exit 1
@@ -51,14 +54,14 @@ for i in "${!VARIANT_NAMES[@]}"; do
     fi
 
     echo "Submitting training for '$name' ($flags)${prev_job:+, after job $prev_job}"
-    train_job=$(sbatch --parsable --job-name="octolora-train-$name" "${dep_arg[@]}" scripts/submit_octolora.sh $flags)
+    train_job=$(sbatch --parsable --job-name="octolora-gsm8k-train-$name" "${dep_arg[@]}" scripts/submit_octolora.sh $flags)
     echo "  -> train job $train_job"
 
     echo "Submitting evaluation for '$name', after job $train_job"
     if [[ -n "$N_EXAMPLES" ]]; then
-        eval_job=$(sbatch --parsable --job-name="octolora-eval-$name" --dependency=afterok:"$train_job" scripts/submit_evaluate.sh "results/$name" "$N_EXAMPLES")
+        eval_job=$(sbatch --parsable --job-name="octolora-gsm8k-eval-$name" --dependency=afterok:"$train_job" scripts/submit_evaluate.sh "results/$name" "$N_EXAMPLES")
     else
-        eval_job=$(sbatch --parsable --job-name="octolora-eval-$name" --dependency=afterok:"$train_job" scripts/submit_evaluate.sh "results/$name")
+        eval_job=$(sbatch --parsable --job-name="octolora-gsm8k-eval-$name" --dependency=afterok:"$train_job" scripts/submit_evaluate.sh "results/$name")
     fi
     echo "  -> eval job $eval_job"
 

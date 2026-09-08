@@ -1,117 +1,29 @@
+"""
+GSM8K evaluation for a trained OctoLoRA checkpoint.
+Shared architecture/checkpoint-loading logic lives in octolora_core.py.
+"""
+
 import argparse
 import json
 import os
-import torch
-import torch.nn as nn
 import re
+
+import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# --- CONFIG ---
-MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+from octolora_core import (
+    ALPHA,
+    MODEL_ID,
+    RANK,
+    inject_octo_lora,
+    load_checkpoint_weights,
+    load_run_config,
+    resolve_checkpoint,
+)
+
 CHECKPOINT_PATH = "./results/octo_lora_plus/checkpoint-702"
-MAX_LEN = 512
-RANK = 16
-ALPHA = 32
 
 
-# ─────────────────────────────────────────────────────────────
-# CUSTOM LAYER SCHEMATICS
-# Must stay byte-for-byte identical to train.py's OctoLoRALayer. This used
-# to define a different gating mechanism (a "linearity score" heuristic)
-# than the one actually used during training (gradient-norm EMA routing),
-# so a trained checkpoint's A/B weights were being evaluated through a
-# routing function they were never optimized under.
-# ─────────────────────────────────────────────────────────────
-
-class OctoLoRALayer(nn.Module):
-    def __init__(self, base_layer: nn.Linear, rank: int = 16, alpha: float = 32, use_gate: bool = True):
-        super().__init__()
-        in_dim = base_layer.in_features
-        out_dim = base_layer.out_features
-
-        self.base = base_layer
-        self.base.requires_grad_(False)
-
-        self.A = nn.Linear(in_dim, rank, bias=False)
-        self.B = nn.Linear(rank, out_dim, bias=False)
-        self.scale = alpha / rank
-        self.use_gate = use_gate
-
-        if self.use_gate:
-            self.register_buffer("grad_norm_A", torch.tensor(1.0))
-            self.register_buffer("grad_norm_B", torch.tensor(1.0))
-            self.ema = 0.9
-
-        self.A.weight.requires_grad = True
-        self.B.weight.requires_grad = True
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = self.base(x)
-        mid = self.A(x)
-
-        if self.use_gate:
-            total = self.grad_norm_A + self.grad_norm_B + 1e-8
-            a_weight = (self.grad_norm_B / total).clamp(0.1, 1.0)
-            mid = mid * a_weight + mid.detach() * (1 - a_weight)
-
-        adapter = self.B(mid) * self.scale
-        return base_out + adapter
-
-
-def inject_octo_lora(model, rank=16, alpha=32, target_modules=None, use_gate=True):
-    if target_modules is None:
-        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
-
-    replaced = 0
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
-            continue
-        if not any(t in name for t in target_modules):
-            continue
-
-        parts  = name.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        attr = parts[-1]
-
-        device = module.weight.device
-        dtype = module.weight.dtype
-
-        octo = OctoLoRALayer(module, rank=rank, alpha=alpha, use_gate=use_gate)
-        octo.to(device=device, dtype=dtype)
-
-        setattr(parent, attr, octo)
-        replaced += 1
-
-    print(f"[OctoLoRA] Injected {replaced} custom architecture boundaries (gate={use_gate}).", flush=True)
-    model.config.use_cache = False
-    return model
-
-
-def resolve_checkpoint(path: str) -> str:
-    """Accepts either a specific checkpoint-N directory or a run's output_dir
-    (e.g. results/vanilla_lora) and returns the actual checkpoint directory,
-    picking the highest-step checkpoint-N subdirectory if given the latter.
-    """
-    has_weights = os.path.exists(os.path.join(path, "model.safetensors")) or \
-        os.path.exists(os.path.join(path, "pytorch_model.bin"))
-    if has_weights:
-        return path
-
-    candidates = [
-        d for d in os.listdir(path)
-        if d.startswith("checkpoint-") and os.path.isdir(os.path.join(path, d))
-    ] if os.path.isdir(path) else []
-    if not candidates:
-        raise FileNotFoundError(
-            f"{path} has no model weights and no checkpoint-N subdirectories"
-        )
-    latest = max(candidates, key=lambda d: int(d.split("-")[-1]))
-    return os.path.join(path, latest)
-
-
-# --- 1. EVALUATION UTILS ---
 def extract_answer(text: str) -> str | None:
     match = re.search(r"####\s*([\d,.-]+)", text)
     if match:
@@ -153,13 +65,10 @@ def evaluate_gsm8k(model, tokenizer, n_examples=None, device="cuda", data_path="
         generated = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         pred = extract_answer(generated)
         target = extract_answer(example["output"])
-        
+
         if pred and target and pred == target:
             correct += 1
-            
-        
-        
-    
+
     acc = correct / len(dataset)
     print("\n=========================================", flush=True)
     print(f"OCTOLORA GSM8K FINAL ACCURACY: {correct}/{len(dataset)} = {acc:.2%}", flush=True)
@@ -185,20 +94,10 @@ if __name__ == "__main__":
     checkpoint_path = resolve_checkpoint(args.checkpoint)
 
     # Runs produced by the ablation-aware train.py write octolora_run_config.json
-    # alongside the checkpoint (in the run's output_dir, one level up from a
-    # specific checkpoint-N folder). Older checkpoints (e.g. checkpoint-702,
-    # trained before this existed) don't have it - fall back to the
-    # historical defaults (gate on, rank 16, alpha 32) in that case.
-    run_config = {"use_gate": True, "rank": RANK, "alpha": ALPHA}
-    for config_dir in (checkpoint_path, os.path.dirname(checkpoint_path.rstrip("/"))):
-        config_path = os.path.join(config_dir, "octolora_run_config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                run_config.update(json.load(f))
-            print(f"Loaded run config from {config_path}: {run_config}", flush=True)
-            break
-    else:
-        print(f"No octolora_run_config.json found near {checkpoint_path}; assuming gate=True, rank={RANK}, alpha={ALPHA}", flush=True)
+    # alongside the checkpoint. Older checkpoints (e.g. checkpoint-702, trained
+    # before this existed) don't have it - fall back to the historical
+    # defaults (gate on, rank 16, alpha 32) in that case.
+    run_config = load_run_config(checkpoint_path, defaults={"use_gate": True, "rank": RANK, "alpha": ALPHA})
 
     print("Initializing components...", flush=True)
     print("Loading tokenizer...", flush=True)
@@ -218,18 +117,7 @@ if __name__ == "__main__":
     )
 
     print(f"Loading custom weights from checkpoint: {checkpoint_path}", flush=True)
-    safetensors_file = os.path.join(checkpoint_path, "model.safetensors")
-    pytorch_file = os.path.join(checkpoint_path, "pytorch_model.bin")
-
-    if os.path.exists(safetensors_file):
-        from safetensors.torch import load_file
-        state_dict = load_file(safetensors_file)
-        model.load_state_dict(state_dict, strict=False)
-    elif os.path.exists(pytorch_file):
-        state_dict = torch.load(pytorch_file, map_location="cpu")
-        model.load_state_dict(state_dict, strict=False)
-    else:
-        raise FileNotFoundError(f"Could not locate training checkpoint files in {checkpoint_path}")
+    model = load_checkpoint_weights(model, checkpoint_path)
 
     print("Framework generation completed. Starting evaluation pipeline...", flush=True)
     evaluate_gsm8k(model, tokenizer, n_examples=args.n_examples)
