@@ -62,7 +62,12 @@ def evaluate_mmlu(model, tokenizer, n_examples=None, device="cuda", k_shot=5):
         dev_by_subject.setdefault(ex["subject"], []).append(ex)
 
     if n_examples is not None:
-        test_ds = test_ds.select(range(min(n_examples, len(test_ds))))
+        # MMLU's test split is grouped contiguously by subject (confirmed:
+        # the first 200 rows are 100% abstract_algebra + anatomy, two
+        # harder-than-average subjects out of 57) - taking a subset without
+        # shuffling first would silently score only whichever subjects
+        # happen to sort first, not a representative cross-section.
+        test_ds = test_ds.shuffle(seed=42).select(range(min(n_examples, len(test_ds))))
     print(f"Loaded {len(test_ds)} test examples. Starting log-likelihood scoring...", flush=True)
 
     # Letter token ids, resolved once against this tokenizer. Taking the
