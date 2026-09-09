@@ -75,13 +75,20 @@ def evaluate_mmlu(model, tokenizer, n_examples=None, device="cuda", k_shot=5):
     for i, example in enumerate(test_ds):
         subject_readable = example["subject"].replace("_", " ")
         prefix = build_fewshot_prefix(dev_by_subject, example["subject"], k=k_shot)
+        # Deliberately NOT wrapped in the chat template. The standard MMLU
+        # protocol - and the only thing consistent with how the few-shot
+        # examples above are formatted (flowing "...Answer: X" text, not
+        # separated chat turns) - is plain continuation scoring: the model
+        # predicts the very next token after "Answer:" as if completing
+        # the same block of text the few-shot examples are written in. An
+        # earlier version of this function wrapped the prompt in Llama-3's
+        # chat template and scored the first token of a *fresh assistant
+        # turn* instead, which isn't primed as a continuation of "Answer:"
+        # the way plain text is - that scored 38% on the raw base model
+        # (should be ~65-70%), a bug caught via scripts/diagnose_mmlu_baseline.py.
         prompt = (
-            "<|begin_of_text|>"
-            "<|start_header_id|>user<|end_header_id|>\n\n"
             f"The following are multiple choice questions (with answers) about {subject_readable}.\n\n"
             f"{prefix}{format_question(example['question'], example['choices'])}"
-            "<|eot_id|>"
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
